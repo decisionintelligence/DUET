@@ -12,7 +12,7 @@ import pandas as pd
 from ts_benchmark.baselines.utils import (
     forecasting_data_provider,
     train_val_split,
-    get_time_mark
+    get_time_mark,
 )
 from ts_benchmark.baselines.duet.models.duet_model import DUETModel
 from ...models.model_base import ModelBase, BatchMaker
@@ -49,7 +49,8 @@ DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS = {
     "num_experts": 4,
     "noisy_gating": True,
     "k": 1,
-    "CI": True
+    "CI": True,
+    "parallel_strategy": "DP",
 }
 
 
@@ -60,6 +61,11 @@ class TransformerConfig:
 
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+        if self.parallel_strategy not in [None, "DP"]:
+            raise ValueError(
+                "Invalid value for parallel_strategy. Supported values are 'DP' and None."
+            )
 
     @property
     def pred_len(self):
@@ -88,7 +94,7 @@ class DUET(ModelBase):
         return {
             "seq_len": "input_chunk_length",
             "horizon": "output_chunk_length",
-            "norm": "norm"
+            "norm": "norm",
         }
 
     def __repr__(self) -> str:
@@ -190,6 +196,7 @@ class DUET(ModelBase):
         )
         padding_mark = get_time_mark(whole_time_stamp, 1, self.config.freq)
         return padding_mark
+
     def validate(self, valid_data_loader, criterion):
         config = self.config
         total_loss = []
@@ -206,8 +213,8 @@ class DUET(ModelBase):
 
                 output, _ = self.model(input)
 
-                target = target[:, -config.horizon:, :]
-                output = output[:, -config.horizon:, :]
+                target = target[:, -config.horizon :, :]
+                output = output[:, -config.horizon :, :]
                 loss = criterion(output, target).detach().cpu().numpy()
                 total_loss.append(loss)
 
@@ -215,7 +222,9 @@ class DUET(ModelBase):
         self.model.train()
         return total_loss
 
-    def forecast_fit(self, train_valid_data: pd.DataFrame, train_ratio_in_tv: float) -> "ModelBase":
+    def forecast_fit(
+        self, train_valid_data: pd.DataFrame, train_ratio_in_tv: float
+    ) -> "ModelBase":
         """
         Train the model.
 
@@ -232,6 +241,11 @@ class DUET(ModelBase):
             self.multi_forecasting_hyper_param_tune(train_valid_data)
 
         self.model = DUETModel(self.config)
+
+        device_ids = np.arange(torch.cuda.device_count()).tolist()
+        print(device_ids)
+        if len(device_ids) > 1 and self.config.parallel_strategy == "DP":
+            self.model = nn.DataParallel(self.model, device_ids=device_ids)
 
         print(
             "----------------------------------------------------------",
@@ -300,7 +314,7 @@ class DUET(ModelBase):
             self.model.train()
             # for input, target, input_mark, target_mark in train_data_loader:
             for i, (input, target, input_mark, target_mark) in enumerate(
-                    train_data_loader
+                train_data_loader
             ):
                 optimizer.zero_grad()
                 input, target, input_mark, target_mark = (
@@ -313,8 +327,8 @@ class DUET(ModelBase):
 
                 output, loss_importance = self.model(input)
 
-                target = target[:, -config.horizon:, :]
-                output = output[:, -config.horizon:, :]
+                target = target[:, -config.horizon :, :]
+                output = output[:, -config.horizon :, :]
                 loss = criterion(output, target)
 
                 total_loss = loss + loss_importance
@@ -379,7 +393,7 @@ class DUET(ModelBase):
                     output, _ = self.model(input)
 
                 column_num = output.shape[-1]
-                temp = output.cpu().numpy().reshape(-1, column_num)[-config.horizon:]
+                temp = output.cpu().numpy().reshape(-1, column_num)[-config.horizon :]
 
                 if answer is None:
                     answer = temp
@@ -393,11 +407,11 @@ class DUET(ModelBase):
                         )
                     return answer[-horizon:]
 
-                output = output.cpu().numpy()[:, -config.horizon:, :]
+                output = output.cpu().numpy()[:, -config.horizon :, :]
                 for i in range(config.horizon):
                     test.iloc[i + config.seq_len] = output[0, i, :]
 
-                test = test.iloc[config.horizon:]
+                test = test.iloc[config.horizon :]
                 test = self.padding_data_for_forecast(test)
 
                 test_data_set, test_data_loader = forecasting_data_provider(

@@ -13,7 +13,7 @@ If you find this project helpful, please don't forget to give it a ⭐ Star to s
 
 🚩 News (2025.04) [Introduction video](https://dl.acm.org/doi/10.1145/3690624.3709325) about DUET (in English).
 
-🚩 News (2024.12) DUET has been included in the time series forecasting benchmark [TFB](https://github.com/decisionintelligence/TFB) and the time series analytics leaderboard [OpenTS](https://decisionintelligence.github.io/OpenTS/).
+🚩 News (2024.12) DUET has been included in the time series forecasting benchmark [TFB](https://github.com/decisionintelligence/TFB) and the time series analytics leaderboard [OpenTS-Bench](https://decisionintelligence.github.io/OpenTS/leaderboards/#multivariate_forecasting).
 
 🚩 News (2024.11) DUET has been accepted by SIGKDD 2025.
 

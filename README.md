@@ -11,6 +11,8 @@ If you find this project helpful, please don't forget to give it a ⭐ Star to s
 > [!IMPORTANT]
 > DUET has released the results of a long-term forecasting task with unified hyperparameters, where the **input length is fixed at 96** for all experiments. Click [here](https://github.com/decisionintelligence/DUET/blob/main/figures/DUET_unified_seq_len_96.pdf) to view the results, and click [here](https://github.com/decisionintelligence/DUET/blob/main/scripts/multivariate_forecast/DUET_unified_seq_len_96.sh) to view the script for reproducing the results.
 
+🚩 News (2025.12) Time series model ([DUET](https://arxiv.org/pdf/2412.10859))  was ranked 1th of the most influential papers in KDD 2025!
+
 🚩 News (2025.04) [Introduction video](https://dl.acm.org/doi/10.1145/3690624.3709325) about DUET (in English).
 
 🚩 News (2024.12) DUET has been included in the time series forecasting benchmark [TFB](https://github.com/decisionintelligence/TFB) and the time series analytics leaderboard [OpenTS-Bench](https://decisionintelligence.github.io/OpenTS/leaderboards/#multivariate_forecasting).

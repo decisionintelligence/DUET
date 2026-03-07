@@ -138,7 +138,7 @@ We would like to thank [Jiyanglin Li](https://github.com/erikalien5595) for iden
 If you have any questions or suggestions, feel free to contact:
 
 - [Xiangfei Qiu](https://qiu69.github.io/) (xfqiu@stu.ecnu.edu.cn)
-- Xingjian Wu (xjwu@stu.ecnu.edu.cn)
+- [Xingjian Wu](https://ccloud0525.github.io/) (xjwu@stu.ecnu.edu.cn)
 
 
 Or describe it in Issues.

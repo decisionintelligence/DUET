@@ -5,6 +5,9 @@ import logging
 import os
 import sys
 import warnings
+import shutil
+from datetime import datetime
+
 from typing import Dict, NoReturn
 
 import torch
@@ -13,7 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(__file__))))
 
 from ts_benchmark.utils.get_file_name import get_unique_file_suffix
 from ts_benchmark.report import report
-from ts_benchmark.common.constant import CONFIG_PATH, THIRD_PARTY_PATH
+from ts_benchmark.common.constant import CONFIG_PATH, THIRD_PARTY_PATH, ROOT_PATH
 from ts_benchmark.pipeline import pipeline
 from ts_benchmark.utils.parallel import ParallelBackend
 
@@ -352,3 +355,95 @@ if __name__ == "__main__":
         leaderboard_file_name = "test_report" + filename
         report_config["leaderboard_file_name"] = leaderboard_file_name
     report(report_config, report_method=args.report_method)
+
+    # 生成汇总的 RESULTS.md
+    generate_results_summary(args.save_path, args.model_name[0] if args.model_name else "Model")
+
+
+def generate_results_summary(save_path: str, model_name: str) -> None:
+    """
+    从所有 test_report 文件生成汇总的 RESULTS.md
+    """
+    result_dir = os.path.join(ROOT_PATH, "result", save_path)
+
+    # 查找所有 test_report CSV 文件
+    if not os.path.exists(result_dir):
+        return
+
+    test_reports = [f for f in os.listdir(result_dir) if f.startswith("test_report") and f.endswith(".csv")]
+
+    if not test_reports:
+        return
+
+    import csv
+
+    # 收集每个 horizon 的指标
+    horizon_results = {}  # {horizon: {"mse_norm": x, "mae_norm": x, "rmse_norm": x}}
+
+    for report_file in test_reports:
+        report_path = os.path.join(result_dir, report_file)
+        try:
+            with open(report_path, 'r') as f:
+                reader = csv.reader(f)
+                header = next(reader)  # 跳过标题行
+
+                for row in reader:
+                    if len(row) < 3:
+                        continue
+
+                    # 提取 horizon（从第一列的JSON中）
+                    strategy_args_str = row[0]
+                    import re
+                    match = re.search(r'"horizon"\s*:\s*(\d+)', strategy_args_str)
+                    if not match:
+                        continue
+
+                    current_horizon = int(match.group(1))
+
+                    # 提取指标名和值
+                    metric_name = row[1].strip() if len(row) > 1 else ""
+                    metric_value = row[2].strip() if len(row) > 2 else None
+
+                    if metric_name in ["mse_norm", "mae_norm", "rmse_norm"]:
+                        if current_horizon not in horizon_results:
+                            horizon_results[current_horizon] = {}
+                        horizon_results[current_horizon][metric_name] = metric_value
+
+        except Exception as e:
+            print(f"Warning: Failed to parse {report_file}: {e}")
+            continue
+
+    # 生成 RESULTS.md
+    if horizon_results:
+        # 按 horizon 排序
+        sorted_horizons = sorted(horizon_results.keys())
+
+        md_content = f"# {model_name} 实验结果\n\n"
+        md_content += "## ETTh1 数据集\n\n"
+        md_content += "| Horizon | MSE_norm | MAE_norm | RMSE_norm |\n"
+        md_content += "|---------|----------|----------|-----------|\n"
+
+        for h in sorted_horizons:
+            results = horizon_results[h]
+            mse = results.get("mse_norm", "N/A")
+            mae = results.get("mae_norm", "N/A")
+            rmse = results.get("rmse_norm", "N/A")
+            md_content += f"|      {h} |   {mse} |   {mae} |    {rmse} |\n"
+
+        # 添加配置说明（如果使用量子模块）
+        if "quantum" in model_name.lower() or "DUET_quantum" in save_path:
+            md_content += "\n## 配置说明\n\n"
+            md_content += "- `use_quantum_block: true` - 启用量子 OTOC 块\n"
+            md_content += "- 其他参数与原版 DUET 相同\n"
+
+        md_content += "\n## 关于压缩文件\n\n"
+        md_content += "输出目录中的 `.csv.tar.gz` 文件是预测结果（原始预测值），由 benchmark 框架自动压缩保存。\n"
+        md_content += "如需查看具体预测值，可以解压：\n\n"
+        md_content += f"```bash\ntar -xzf result/{save_path}/DUET.xxx.csv.tar.gz\n```\n"
+
+        # 写入 RESULTS.md
+        results_md_path = os.path.join(result_dir, "RESULTS.md")
+        with open(results_md_path, 'w') as f:
+            f.write(md_content)
+
+        print(f"Results summary saved to: {results_md_path}")

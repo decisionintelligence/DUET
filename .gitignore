@@ -1,8 +1,11 @@
 dataset/
-result/
+# result/
+
 .idea/
 .vscode/
 .git
 *.DS_Store
 venv/
 __pycache__/
+*.csv.tar.gz
+*.csv

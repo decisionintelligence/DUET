@@ -2,11 +2,13 @@
 
 from __future__ import absolute_import
 
-from ts_benchmark.report import report_dash, report_csv
+from ts_benchmark.report import report_csv
 
 
 def report(report_config: dict, report_method: str = "csv") -> None:
     if report_method == "dash":
+        # Lazy import to avoid loading dash if not needed
+        from ts_benchmark.report import report_dash
         report_dash.report(report_config)
     elif report_method == "csv":
         report_csv.report(report_config)

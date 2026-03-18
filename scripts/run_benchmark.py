@@ -356,10 +356,6 @@ if __name__ == "__main__":
         report_config["leaderboard_file_name"] = leaderboard_file_name
     report(report_config, report_method=args.report_method)
 
-    # 生成汇总的 RESULTS.md
-    generate_results_summary(args.save_path, args.model_name[0] if args.model_name else "Model")
-
-
 def generate_results_summary(save_path: str, model_name: str) -> None:
     """
     从所有 test_report 文件生成汇总的 RESULTS.md

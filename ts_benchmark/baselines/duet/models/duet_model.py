@@ -14,15 +14,10 @@ from ts_benchmark.baselines.duet.utils.masked_attention import (
 
 class QuantumOTOCBlock(nn.Module):
     """
-    Quantum-inspired feature mixing block - v8 极简版本
+    Quantum-inspired feature mixing block - v9 纯量子版
 
-    设计理念：参考 Q-SSM (Quantum State Space Model) 的轻量设计
-
-    关键改动：
-    1. 使用简化的酉旋转门替代复杂的 Cayley 变换
-    2. 轻量级特征混合 (无复杂 SE 门控)
-    3. 作为辅助增强而非替换 Channel Transformer
-    4. 残差优先 (alpha=0.9)
+    消融实验：只使用量子模块，不经过 Highway Gate
+    测试量子模块是否在 ETTh1 上有效
     """
 
     def __init__(self, d_model: int, n_heads: int = 4):
@@ -31,82 +26,88 @@ class QuantumOTOCBlock(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
 
-        # 极简设计：仅用少量参数
-        # 酉旋转门参数 (RY-RX ansatz 风格)
-        self.theta_real = nn.Parameter(torch.randn(n_heads, self.d_k) * 0.1)
-        self.theta_imag = nn.Parameter(torch.randn(n_heads, self.d_k) * 0.1)
+        # 原始 Cayley 变换设计
+        self.real_linear = nn.Linear(d_model, d_model)
+        self.imag_linear = nn.Linear(d_model, d_model)
 
-        # 轻量级门控
-        self.gate = nn.Sequential(
-            nn.Linear(d_model, d_model // 8),
-            nn.GELU(),
-            nn.Linear(d_model // 8, 1)
-        )
+        self.se_fc1 = nn.Linear(d_model, d_model // 4)
+        self.se_fc2 = nn.Linear(d_model // 4, d_model)
 
-        # 极简投影
+        nn_init = nn.init.eye_
+        self.H_real = nn.Parameter(torch.randn(n_heads, self.d_k, self.d_k) * 0.01)
+        self.H_imag = nn.Parameter(torch.randn(n_heads, self.d_k, self.d_k) * 0.01)
+        for i in range(n_heads):
+            nn_init(self.H_real.data[i])
+            nn.init.zeros_(self.H_imag.data[i])
+
+        self.M_real = nn.Parameter(torch.randn(n_heads, self.d_k, self.d_k) * 0.01)
+        self.M_imag = nn.Parameter(torch.randn(n_heads, self.d_k, self.d_k) * 0.01)
+        for i in range(n_heads):
+            nn_init(self.M_real.data[i])
+            nn_init(self.M_imag.data[i])
+
         self.projection = nn.Linear(d_model, d_model)
 
-        # 残差权重：让原始特征主导
-        self.alpha = nn.Parameter(torch.tensor(0.9))
+        # alpha=0.5 平衡设计
+        self.alpha = nn.Parameter(torch.tensor(0.5))
 
         self.norm = nn.LayerNorm(d_model)
 
-    def _unitary_rotation(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        简化的酉旋转门
-        参考 Q-SSM 的 RY-RX ansatz 思想
-        """
-        B, N, H, D = x.shape
+    def _cayley_unitary(self, H: torch.Tensor) -> torch.Tensor:
+        d = H.size(-1)
+        I = torch.eye(d, device=H.device, dtype=H.dtype)
+        A = I + 0.5j * H
+        B = I - 0.5j * H
+        U = torch.linalg.solve(A, B)
+        return U
 
-        # 归一化
-        norm = x.abs().norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        x_norm = x / norm
-
-        # 将实数张量转换为复数形式
-        x_complex = torch.complex(x_norm, torch.zeros_like(x_norm))
-
-        # 计算旋转角度 (基于酉旋转)
-        theta = torch.atan2(x_complex.abs(), 1.0 + x_complex.abs())
-        phi = torch.angle(x_complex)
-
-        # 应用酉旋转
-        cos_t = torch.cos(theta + self.theta_real.unsqueeze(0).unsqueeze(0))
-        sin_t = torch.sin(theta + self.theta_imag.unsqueeze(0).unsqueeze(0))
-
-        # 酉旋转: U = cos(θ)I - i*sin(θ)*e^{iφ}
-        real_part = cos_t * x_complex.real - sin_t * x_complex.imag
-        imag_part = cos_t * x_complex.imag + sin_t * x_complex.real
-
-        rotated = torch.complex(real_part, imag_part)
-
-        return rotated
+    def _se_gate(self, x: torch.Tensor) -> torch.Tensor:
+        s = torch.mean(x, dim=1)
+        s = F.relu(self.se_fc1(s))
+        s = torch.sigmoid(self.se_fc2(s))
+        return s.unsqueeze(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, D = x.shape
         x_residual = x
 
-        # 轻量门控
-        gate_weight = torch.sigmoid(self.gate(x))
+        se_weight = self._se_gate(x)
 
-        # 转换为多头格式
-        x_reshaped = x.view(B, N, self.n_heads, self.d_k)
+        real = self.real_linear(x)
+        imag = self.imag_linear(x)
+        psi_0 = torch.complex(real, imag)
 
-        # 应用酉旋转
-        rotated = self._unitary_rotation(x_reshaped)
+        norm = psi_0.abs().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        psi_0 = psi_0 / norm
+        psi_0 = psi_0.view(B, N, self.n_heads, self.d_k)
 
-        # 恢复形状并转回实数
-        rotated = rotated.view(B, N, D)
-        rotated = torch.real(rotated)  # 复数转实数
+        H_real = (self.H_real + self.H_real.transpose(-2, -1)) / 2
+        H_imag = (self.H_imag - self.H_imag.transpose(-2, -1)) / 2
+        H = torch.complex(H_real, H_imag)
 
-        # 投影
-        rotated = self.projection(rotated)
+        M_real = (self.M_real + self.M_real.transpose(-2, -1)) / 2
+        M_imag = (self.M_imag - self.M_imag.transpose(-2, -1)) / 2
+        M_ham = torch.complex(M_real, M_imag)
 
-        # 门控混合
-        z_out = gate_weight * rotated + (1 - gate_weight) * x
+        H = H / (H.abs().max().clamp_min(1e-3))
+        M_ham = M_ham / (M_ham.abs().max().clamp_min(1e-3))
 
+        U = self._cayley_unitary(H)
+        M_basis = self._cayley_unitary(M_ham)
+
+        psi_t = torch.einsum('bnhd,hde->bnhe', psi_0, U.conj().transpose(-2, -1))
+        psi_measured = torch.einsum('bnhd,hde->bnhe', psi_t, M_basis)
+        meas_prob = torch.abs(psi_measured) ** 2
+
+        prob_matrix = torch.abs(U) ** 2
+        otoc_matrix = 2.0 * (prob_matrix * (1.0 - prob_matrix))
+        otoc_weight = F.softmax(otoc_matrix, dim=-1)
+
+        z_out = torch.einsum('bnhd,hde->bnhe', meas_prob, otoc_weight.transpose(-2, -1))
+        z_out = z_out.reshape(B, N, D)
+        z_out = z_out * se_weight
         z_out = self.norm(z_out)
-
-        # 极保守残差连接
+        z_out = self.projection(z_out)
         z_out = self.alpha * z_out + (1 - self.alpha) * x_residual
 
         return z_out
@@ -337,13 +338,19 @@ class DUETModel(nn.Module):
         self.use_highway_gate = getattr(config, "use_highway_gate", False)
         self.use_adaptive_fusion = getattr(config, "use_adaptive_fusion", False)
         self.use_enhanced_head = getattr(config, "use_enhanced_head", False)
+        self.use_quantum_parallel = getattr(config, "use_quantum_parallel", False)  # v9新增
 
         n_heads = getattr(config, "n_heads", 4)
 
         if self.use_quantum_block:
             self.quantum_block = QuantumOTOCBlock(config.d_model, n_heads=n_heads)
 
-            if self.use_adaptive_fusion:
+            if self.use_quantum_parallel:
+                # v9新增：并行架构
+                self.adaptive_fusion = None
+                self.attn_residuals = None
+                self.highway_gate = None
+            elif self.use_adaptive_fusion:
                 self.adaptive_fusion = AdaptiveFusion(config.d_model, n_heads=n_heads)
                 self.attn_residuals = None
                 self.highway_gate = None
@@ -392,7 +399,17 @@ class DUETModel(nn.Module):
             if self.quantum_block is not None:
                 quantum_output = self.quantum_block(temporal_feature)
 
-                if self.use_adaptive_fusion and self.adaptive_fusion is not None:
+                if self.use_quantum_parallel:
+                    # v9 新增：量子模块与Channel Transformer并行融合
+                    changed_input = rearrange(input, "b l n -> b n l")
+                    channel_mask = self.mask_generator(changed_input)
+                    transformer_output, _ = self.Channel_transformer(
+                        x=temporal_feature, attn_mask=channel_mask
+                    )
+                    # 并行融合：各50%权重
+                    channel_group_feature = 0.5 * quantum_output + 0.5 * transformer_output
+
+                elif self.use_adaptive_fusion and self.adaptive_fusion is not None:
                     changed_input = rearrange(input, "b l n -> b n l")
                     channel_mask = self.mask_generator(changed_input)
                     transformer_output, _ = self.Channel_transformer(

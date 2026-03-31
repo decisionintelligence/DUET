@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import os
 import time
 from typing import List, Optional
 
@@ -8,6 +9,7 @@ import pandas as pd
 from ts_benchmark.evaluation.metrics import regression_metrics
 from ts_benchmark.evaluation.strategy.constants import FieldNames
 from ts_benchmark.evaluation.strategy.forecasting import ForecastingStrategy
+from ts_benchmark.evaluation.visualization import create_forecast_visualization
 from ts_benchmark.models import ModelFactory
 from ts_benchmark.utils.data_processing import split_before
 
@@ -39,6 +41,7 @@ class FixedForecast(ForecastingStrategy):
         "horizon",
         "train_ratio_in_tv",
         "save_true_pred",
+        "save_vis",
     ]
 
     def _execute(
@@ -54,6 +57,7 @@ class FixedForecast(ForecastingStrategy):
         train_ratio_in_tv = self._get_scalar_config_value(
             "train_ratio_in_tv", series_name
         )
+        save_vis = self._get_scalar_config_value("save_vis", series_name)
 
         data_len = int(self._get_meta_info(meta_info, "length", len(series)))
         train_length = data_len - horizon
@@ -79,9 +83,24 @@ class FixedForecast(ForecastingStrategy):
             predicted, columns=test_data.columns, index=test_data.index
         )
 
+        # Save visualization if enabled
+        visualization_paths = []
+        if save_vis:
+            visualization_paths = self._save_visualization(
+                series_name=series_name,
+                actual=test_data,
+                predicted=inference_data,
+                horizon=horizon
+            )
+
         save_true_pred = self._get_scalar_config_value("save_true_pred", series_name)
         actual_data_encoded = self._encode_data(test_data) if save_true_pred else np.nan
         inference_data_encoded = self._encode_data(inference_data) if save_true_pred else np.nan
+
+        # Append visualization paths to log_info
+        if visualization_paths:
+            vis_info = f"Visualization saved: {visualization_paths}"
+            log_info = log_info + "\n" + vis_info if log_info else vis_info
 
         single_series_results += [
             series_name,
@@ -108,3 +127,35 @@ class FixedForecast(ForecastingStrategy):
             FieldNames.INFERENCE_DATA,
             FieldNames.LOG_INFO,
         ]
+
+    def _save_visualization(
+        self,
+        series_name: str,
+        actual: pd.DataFrame,
+        predicted: pd.DataFrame,
+        horizon: int
+    ) -> dict:
+        """
+        Save visualization plots for the forecast results.
+
+        :param series_name: The name of the series.
+        :param actual: Actual values (DataFrame).
+        :param predicted: Predicted values (DataFrame).
+        :param horizon: Prediction horizon.
+        :return: Dictionary of saved file paths.
+        """
+        save_path = self.strategy_config.get("save_path", "result")
+        vis_dir = os.path.join(save_path, "visualizations", series_name.replace('/', '_'))
+
+        try:
+            saved_files = create_forecast_visualization(
+                series_name=series_name,
+                actual_data=[actual],
+                predicted_data=[predicted],
+                save_dir=vis_dir,
+                horizon=horizon
+            )
+            return saved_files
+        except Exception as e:
+            print(f"Warning: Failed to save visualization for {series_name}: {e}")
+            return {}

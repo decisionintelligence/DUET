@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import itertools
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -10,6 +11,7 @@ from numpy.lib.stride_tricks import sliding_window_view
 from ts_benchmark.evaluation.metrics import regression_metrics
 from ts_benchmark.evaluation.strategy.constants import FieldNames
 from ts_benchmark.evaluation.strategy.forecasting import ForecastingStrategy
+from ts_benchmark.evaluation.visualization import create_forecast_visualization
 from ts_benchmark.models import ModelFactory
 from ts_benchmark.models.model_base import BatchMaker, ModelBase
 from ts_benchmark.utils.data_processing import split_before
@@ -131,6 +133,7 @@ class RollingForecast(ForecastingStrategy):
         "stride",
         "num_rollings",
         "save_true_pred",
+        "save_vis",
     ]
 
     @staticmethod
@@ -221,6 +224,7 @@ class RollingForecast(ForecastingStrategy):
             "train_ratio_in_tv", series_name
         )
         tv_ratio = self._get_scalar_config_value("tv_ratio", series_name)
+        save_vis = self._get_scalar_config_value("save_vis", series_name)
 
         train_length, test_length = self._get_split_lens(series, meta_info, tv_ratio)
         train_valid_data, test_data = split_before(series, train_length)
@@ -257,6 +261,17 @@ class RollingForecast(ForecastingStrategy):
             all_rolling_predict.append(inference_data)
             all_test_results.append(single_series_result)
 
+        # Save visualization if enabled
+        visualization_paths = []
+        if save_vis:
+            visualization_paths = self._save_visualization(
+                series_name=series_name,
+                actual_list=all_rolling_actual,
+                predicted_list=all_rolling_predict,
+                stride=stride,
+                horizon=horizon
+            )
+
         average_inference_time = float(total_inference_time) / min(
             len(index_list), num_rollings
         )
@@ -274,6 +289,10 @@ class RollingForecast(ForecastingStrategy):
             inference_data_encoded,
             "",
         ]
+        # Append visualization paths to log_info
+        if visualization_paths:
+            vis_info = f"Visualization saved: {visualization_paths}"
+            single_series_results[-1] = vis_info
         return single_series_results
 
     def _eval_batch(
@@ -295,6 +314,7 @@ class RollingForecast(ForecastingStrategy):
         stride = self._get_scalar_config_value("stride", series_name)
         horizon = self._get_scalar_config_value("horizon", series_name)
         num_rollings = self._get_scalar_config_value("num_rollings", series_name)
+        save_vis = self._get_scalar_config_value("save_vis", series_name)
 
         train_ratio_in_tv = self._get_scalar_config_value(
             "train_ratio_in_tv", series_name
@@ -349,6 +369,17 @@ class RollingForecast(ForecastingStrategy):
             len(index_list), num_rollings
         )
 
+        # Save visualization if enabled
+        visualization_paths = []
+        if save_vis:
+            visualization_paths = self._save_visualization(
+                series_name=series_name,
+                actual_list=list(targets),
+                predicted_list=list(all_predicts),
+                stride=stride,
+                horizon=horizon
+            )
+
         save_true_pred = self._get_scalar_config_value("save_true_pred", series_name)
         actual_data_encoded = self._encode_data(targets) if save_true_pred else np.nan
         inference_data_encoded = self._encode_data(all_predicts) if save_true_pred else np.nan
@@ -361,6 +392,10 @@ class RollingForecast(ForecastingStrategy):
             inference_data_encoded,
             "",
         ]
+        # Append visualization paths to log_info
+        if visualization_paths:
+            vis_info = f"Visualization saved: {visualization_paths}"
+            single_series_results[-1] = vis_info
         return single_series_results
 
     @staticmethod
@@ -377,3 +412,40 @@ class RollingForecast(ForecastingStrategy):
             FieldNames.INFERENCE_DATA,
             FieldNames.LOG_INFO,
         ]
+
+    def _save_visualization(
+        self,
+        series_name: str,
+        actual_list: list,
+        predicted_list: list,
+        stride: int,
+        horizon: int
+    ) -> dict:
+        """
+        Save visualization plots for the forecast results.
+
+        :param series_name: The name of the series.
+        :param actual_list: List of actual values.
+        :param predicted_list: List of predicted values.
+        :param stride: Rolling stride.
+        :param horizon: Prediction horizon.
+        :return: Dictionary of saved file paths.
+        """
+        # Get save path from strategy config
+        save_path = self.strategy_config.get("save_path", "result")
+        vis_dir = os.path.join(save_path, "visualizations", series_name.replace('/', '_'))
+
+        try:
+            saved_files = create_forecast_visualization(
+                series_name=series_name,
+                actual_data=actual_list,
+                predicted_data=predicted_list,
+                save_dir=vis_dir,
+                stride=stride,
+                horizon=horizon
+            )
+            return saved_files
+        except Exception as e:
+            # Return empty dict if visualization fails, don't break the evaluation
+            print(f"Warning: Failed to save visualization for {series_name}: {e}")
+            return {}

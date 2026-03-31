@@ -6,9 +6,12 @@
 import os
 from typing import List, Optional, Tuple
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from ts_benchmark.evaluation.metrics import regression_metrics
 
 # 设置中文字体支持
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial Unicode MS', 'SimHei']
@@ -50,7 +53,9 @@ def plot_single_forecast(
     title: str = None,
     save_path: str = None,
     n_channels_to_plot: int = 4,
-    alpha: float = 0.8
+    alpha: float = 0.8,
+    scaler=None,
+    channel_names: List[str] = None
 ) -> plt.Figure:
     """
     绘制单个滚动窗口的预测对比图
@@ -64,6 +69,8 @@ def plot_single_forecast(
     :param save_path: 保存路径
     :param n_channels_to_plot: 最多显示的通道数
     :param alpha: 透明度
+    :param scaler: StandardScaler对象，用于计算归一化MSE
+    :param channel_names: 通道名称列表
     :return: matplotlib Figure 对象
     """
     # 处理一维情况
@@ -74,6 +81,14 @@ def plot_single_forecast(
 
     n_timesteps, n_channels = actual.shape
     n_channels_to_plot = min(n_channels_to_plot, n_channels)
+
+    # 与 benchmark 中 mse_norm / mae_norm 一致：在 scaler 变换空间计算误差
+    mse_norms = None
+    mae_norms = None
+    if scaler is not None:
+        err = scaler.transform(actual) - scaler.transform(predicted)
+        mse_norms = np.mean(err ** 2, axis=0)
+        mae_norms = np.mean(np.abs(err), axis=0)
 
     n_rows = n_channels_to_plot
     fig, axes = plt.subplots(n_rows, 1, figsize=(figsize[0], figsize[1] * n_rows / 2), squeeze=False)
@@ -89,11 +104,21 @@ def plot_single_forecast(
         ax.plot(x_labels, actual[:, i], label='Actual', color='#2E86AB', linewidth=1.5, alpha=alpha)
         ax.plot(x_labels, predicted[:, i], label='Predicted', color='#E94F37', linewidth=1.5, alpha=alpha, linestyle='--')
 
+        # 获取通道名称
+        ch_name = channel_names[i] if channel_names and i < len(channel_names) else f"Channel {i}"
+
         # 计算该通道的误差指标
         mse = np.mean((actual[:, i] - predicted[:, i]) ** 2)
         mae = np.mean(np.abs(actual[:, i] - predicted[:, i]))
-        ax.set_title(f'Channel {i}: Actual vs Predicted (MSE={mse:.4f}, MAE={mae:.4f})', fontsize=11)
-        ax.set_xlabel('Time')
+
+        # 如果有归一化MSE，显示mse_norm
+        if mse_norms is not None:
+            mse_norm = mse_norms[i]
+            mae_norm = mae_norms[i]
+            ax.set_title(f'{ch_name}: Actual vs Predicted (MSE={mse:.4f}, MSE_norm={mse_norm:.4f}, MAE_norm={mae_norm:.4f})', fontsize=11)
+        else:
+            ax.set_title(f'{ch_name}: Actual vs Predicted (MSE={mse:.4f}, MAE={mae:.4f})', fontsize=11)
+        ax.set_xlabel('Time Step')
         ax.set_ylabel('Value')
         ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3)
@@ -359,6 +384,195 @@ def plot_error_distribution(
     return fig
 
 
+def _short_dataset_name(series_name: str) -> str:
+    """ETTh2.csv -> ETTh2"""
+    base = os.path.basename(series_name)
+    return base.replace(".csv", "").replace(".CSV", "")
+
+
+def _compute_corr(actual: np.ndarray) -> np.ndarray:
+    """Compute |Pearson correlation| matrix."""
+    n_t, n_c = actual.shape
+    if n_c > 1 and n_t > 2:
+        corr = np.corrcoef(actual.T)
+        return np.abs(np.nan_to_num(corr, nan=0.0))
+    return np.array([[1.0]])
+
+
+def plot_time_domain_forecast(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    series_name: str,
+    horizon: int,
+    model_name: str,
+    channel_names: Optional[List[str]],
+    scaler,
+    save_path: str,
+    dpi: int = 150,
+) -> None:
+    """时域多通道 Actual vs Predicted — 论文 Fig.7 左上风格（热力图单独成图）。"""
+    if actual.ndim == 1:
+        actual = actual.reshape(-1, 1)
+    if predicted.ndim == 1:
+        predicted = predicted.reshape(-1, 1)
+    n_t, n_c = actual.shape
+    if channel_names is None or len(channel_names) != n_c:
+        channel_names = [f"C{i + 1}" for i in range(n_c)]
+
+    ds = _short_dataset_name(series_name)
+    mse_n = (
+        regression_metrics.mse_norm(actual, predicted, scaler)
+        if scaler is not None
+        else float(np.mean((actual - predicted) ** 2))
+    )
+
+    try:
+        cmap_lines = plt.colormaps["tab10"]
+    except (AttributeError, KeyError):
+        cmap_lines = plt.cm.get_cmap("tab10")
+
+    n_rows = min(n_c, 4)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 3.2 * n_rows), squeeze=False)
+    t_idx = np.arange(n_t)
+    for i in range(n_rows):
+        ax = axes[i, 0]
+        color = cmap_lines(i % 10)
+        ax.plot(t_idx, actual[:, i], color=color, linewidth=1.2, label="Actual")
+        ax.plot(t_idx, predicted[:, i], color=color, linewidth=1.0, linestyle="--", alpha=0.85, label="Predicted")
+        mse_i = np.mean((actual[:, i] - predicted[:, i]) ** 2)
+        ax.set_title(f"{channel_names[i]}", fontsize=11)
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Value")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(
+        f"{ds}-H={horizon}-{model_name}  |  mse_norm={mse_n:.4f}  (Time Domain)",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_channel_fft(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    series_name: str,
+    horizon: int,
+    model_name: str,
+    channel_names: Optional[List[str]],
+    scaler,
+    save_path: str,
+    dpi: int = 150,
+) -> None:
+    """各通道 rFFT 幅值谱 — 论文 Fig.7 下方风格，每通道独立子图，不拥挤。"""
+    if actual.ndim == 1:
+        actual = actual.reshape(-1, 1)
+    if predicted.ndim == 1:
+        predicted = predicted.reshape(-1, 1)
+    n_t, n_c = actual.shape
+    if channel_names is None or len(channel_names) != n_c:
+        channel_names = [f"C{i + 1}" for i in range(n_c)]
+
+    ds = _short_dataset_name(series_name)
+
+    try:
+        cmap_lines = plt.colormaps["tab10"]
+    except (AttributeError, KeyError):
+        cmap_lines = plt.cm.get_cmap("tab10")
+
+    n_rows = n_c
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 2.2 * n_rows), squeeze=False)
+    for i in range(n_c):
+        ax = axes[i, 0]
+        color = cmap_lines(i % 10)
+
+        # Actual spectrum (solid)
+        x_act = actual[:, i] - np.mean(actual[:, i])
+        spec_act = np.abs(np.fft.rfft(x_act))
+        freq = np.fft.rfftfreq(n_t)
+
+        # Predicted spectrum (dashed)
+        x_pred = predicted[:, i] - np.mean(predicted[:, i])
+        spec_pred = np.abs(np.fft.rfft(x_pred))
+
+        ax.plot(freq, spec_act, color=color, linewidth=1.2, label="Actual")
+        ax.plot(freq, spec_pred, color=color, linewidth=1.0, linestyle="--", alpha=0.85, label="Predicted")
+
+        # Mark dominant freq
+        if len(spec_act) > 1:
+            k = 1 + int(np.argmax(spec_act[1:]))
+            ax.scatter(freq[k], spec_act[k], color="red", s=18, zorder=5, label=f"Peak@freq={freq[k]:.3f}")
+
+        ax.set_title(f"{channel_names[i]} — rFFT", fontsize=10)
+        ax.set_xlabel("Frequency", fontsize=8)
+        ax.set_ylabel("|rFFT|", fontsize=8)
+        ax.legend(loc="upper right", fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        f"{ds}-H={horizon}-{model_name}  |  rFFT Spectrum per Channel",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_channel_correlation(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    series_name: str,
+    horizon: int,
+    model_name: str,
+    channel_names: Optional[List[str]],
+    scaler,
+    save_path: str,
+    dpi: int = 150,
+) -> None:
+    """通道 |Pearson 相关| 热力图 — 论文 Fig.7 右上风格（独立大图）。"""
+    if actual.ndim == 1:
+        actual = actual.reshape(-1, 1)
+    if predicted.ndim == 1:
+        predicted = predicted.reshape(-1, 1)
+    n_t, n_c = actual.shape
+    if channel_names is None or len(channel_names) != n_c:
+        channel_names = [f"C{i + 1}" for i in range(n_c)]
+
+    ds = _short_dataset_name(series_name)
+    mse_n = (
+        regression_metrics.mse_norm(actual, predicted, scaler)
+        if scaler is not None
+        else float(np.mean((actual - predicted) ** 2))
+    )
+
+    abs_corr = _compute_corr(actual)
+
+    fig, ax = plt.subplots(figsize=(max(6, n_c * 1.2), max(5, n_c * 1.0)))
+    im = ax.imshow(abs_corr, cmap="Blues", vmin=0.0, vmax=1.0, aspect="equal")
+    ax.set_xticks(range(n_c))
+    ax.set_yticks(range(n_c))
+    ax.set_xticklabels(channel_names, rotation=45, ha="right", fontsize=10)
+    ax.set_yticklabels(channel_names, fontsize=10)
+    for i in range(n_c):
+        for j in range(n_c):
+            text_color = "white" if abs_corr[i, j] > 0.5 else "black"
+            ax.text(j, i, f"{abs_corr[i, j]:.2f}", ha="center", va="center",
+                    fontsize=11, color=text_color)
+    ax.set_title(
+        f"{ds}-H={horizon}-{model_name}  |  |Channel Correlation|  (mse_norm={mse_n:.4f})\n"
+        f"Proxy for Mopformer channel attention (arXiv:2412.10859 Fig.7)",
+        fontsize=12, fontweight="bold",
+    )
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="|Pearson r|")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def create_forecast_visualization(
     series_name: str,
     actual_data: np.ndarray,
@@ -366,24 +580,32 @@ def create_forecast_visualization(
     save_dir: str,
     train_data: np.ndarray = None,
     stride: int = 1,
-    horizon: int = 96
+    horizon: int = 96,
+    model_name: str = "Model",
+    scaler=None,
+    channel_names: List[str] = None
 ) -> dict:
     """
     创建完整的预测可视化并保存
 
-    :param series_name: 数据集名称
+    :param series_name: 数据集名称（如 ETTh1）
     :param actual_data: 真实值
     :param predicted_data: 预测值
     :param save_dir: 保存目录
     :param train_data: 训练数据（可选）
     :param stride: 滚动步长
     :param horizon: 预测长度
+    :param model_name: 模型名称（如 Mopformer）
+    :param scaler: StandardScaler对象，用于计算归一化MSE
+    :param channel_names: 通道名称列表（如 HUFL, HULL, MUFL 等）
     :return: 包含保存路径的字典
     """
     os.makedirs(save_dir, exist_ok=True)
 
     saved_files = {}
     safe_series_name = series_name.replace('/', '_').replace('\\', '_')
+    # 生成标题：ETTh1-H=336-Mopformer
+    title_prefix = f"{series_name}-H={horizon}-{model_name}"
 
     # 1. 保存综合预测图（如果提供的是 DataFrame 列表）
     if isinstance(actual_data, list) and len(actual_data) > 0:
@@ -417,7 +639,7 @@ def create_forecast_visualization(
         except Exception as e:
             print(f"Warning: Failed to create multi-rolling plot for {series_name}: {e}")
 
-    # 3. 保存第一个滚动窗口的详细对比图
+    # 3. 保存第一个滚动窗口的详细对比图（主要图表）
     if isinstance(actual_data, list):
         first_actual = actual_data[0]
         first_predicted = predicted_data[0]
@@ -428,24 +650,63 @@ def create_forecast_visualization(
     single_forecast_path = os.path.join(save_dir, f'{safe_series_name}_forecast.png')
     try:
         if isinstance(first_actual, pd.DataFrame):
-            plot_single_forecast(
-                actual=first_actual.values,
-                predicted=first_predicted.values,
-                horizon=horizon,
-                title=f'{series_name} - Forecast vs Actual',
-                save_path=single_forecast_path
-            )
+            actual_vals = first_actual.values
+            pred_vals = first_predicted.values
         else:
-            plot_single_forecast(
-                actual=first_actual,
-                predicted=first_predicted,
-                horizon=horizon,
-                title=f'{series_name} - Forecast vs Actual',
-                save_path=single_forecast_path
-            )
+            actual_vals = first_actual
+            pred_vals = first_predicted
+
+        plot_single_forecast(
+            actual=actual_vals,
+            predicted=pred_vals,
+            horizon=horizon,
+            title=title_prefix,
+            save_path=single_forecast_path,
+            scaler=scaler,
+            channel_names=channel_names
+        )
         saved_files['single_forecast'] = single_forecast_path
     except Exception as e:
         print(f"Warning: Failed to create single forecast plot for {series_name}: {e}")
+
+    # 5. 论文 Fig.7 风格三张独立图：时域、rFFT、通道相关热力图
+    try:
+        if isinstance(actual_data, list):
+            av = actual_data[0].values if isinstance(actual_data[0], pd.DataFrame) else actual_data[0]
+            pv = predicted_data[0].values if isinstance(predicted_data[0], pd.DataFrame) else predicted_data[0]
+        elif isinstance(actual_data, pd.DataFrame):
+            av, pv = actual_data.values, predicted_data.values
+        else:
+            av, pv = actual_data, predicted_data
+
+        # 5a. 时域多通道
+        time_path = os.path.join(save_dir, f'{safe_series_name}_time_domain.png')
+        plot_time_domain_forecast(
+            actual=av, predicted=pv, series_name=series_name,
+            horizon=horizon, model_name=model_name, channel_names=channel_names,
+            scaler=scaler, save_path=time_path,
+        )
+        saved_files['time_domain'] = time_path
+
+        # 5b. 各通道 rFFT
+        fft_path = os.path.join(save_dir, f'{safe_series_name}_rfft.png')
+        plot_channel_fft(
+            actual=av, predicted=pv, series_name=series_name,
+            horizon=horizon, model_name=model_name, channel_names=channel_names,
+            scaler=scaler, save_path=fft_path,
+        )
+        saved_files['rfft'] = fft_path
+
+        # 5c. 通道相关热力图
+        corr_path = os.path.join(save_dir, f'{safe_series_name}_channel_corr.png')
+        plot_channel_correlation(
+            actual=av, predicted=pv, series_name=series_name,
+            horizon=horizon, model_name=model_name, channel_names=channel_names,
+            scaler=scaler, save_path=corr_path,
+        )
+        saved_files['channel_corr'] = corr_path
+    except Exception as e:
+        print(f"Warning: Failed to create time_domain / rfft / channel_corr plots for {series_name}: {e}")
 
     # 4. 保存误差分布图
     if isinstance(actual_data, list):
@@ -460,7 +721,7 @@ def create_forecast_visualization(
         plot_error_distribution(
             actual=all_actual,
             predicted=all_predicted,
-            title=f'{series_name} - Error Analysis',
+            title=title_prefix,
             save_path=error_dist_path
         )
         saved_files['error_distribution'] = error_dist_path

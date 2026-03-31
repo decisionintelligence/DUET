@@ -197,16 +197,22 @@ class RollingForecast(ForecastingStrategy):
         """
         model = model_factory()
         if model.batch_forecast.__annotations__.get("not_implemented_batch"):
-            return self._eval_sample(series, meta_info, model, series_name)
+            return self._eval_sample(series, meta_info, model, series_name, model_factory)
         else:
-            return self._eval_batch(series, meta_info, model, series_name)
+            return self._eval_batch(series, meta_info, model, series_name, model_factory)
  
+    @staticmethod
+    def _display_model_name(model_factory: ModelFactory) -> str:
+        n = model_factory.model_name
+        return n.split(".")[-1] if "." in n else n
+
     def _eval_sample(
         self,
         series: pd.DataFrame,
         meta_info: Optional[pd.Series],
         model: ModelBase,
         series_name: str,
+        model_factory: ModelFactory,
     ) -> List:
         """
         The sample execution pipeline of forecasting tasks.
@@ -264,12 +270,17 @@ class RollingForecast(ForecastingStrategy):
         # Save visualization if enabled
         visualization_paths = []
         if save_vis:
+            # 获取通道名称
+            channel_names = list(train_valid_data.columns)
             visualization_paths = self._save_visualization(
                 series_name=series_name,
                 actual_list=all_rolling_actual,
                 predicted_list=all_rolling_predict,
                 stride=stride,
-                horizon=horizon
+                horizon=horizon,
+                model_name=self._display_model_name(model_factory),
+                eval_scaler=eval_scaler,
+                channel_names=channel_names
             )
 
         average_inference_time = float(total_inference_time) / min(
@@ -301,6 +312,7 @@ class RollingForecast(ForecastingStrategy):
         meta_info: Optional[pd.Series],
         model: ModelBase,
         series_name: str,
+        model_factory: ModelFactory,
     ) -> List:
         """
         The batch execution pipeline of forecasting tasks.
@@ -372,12 +384,16 @@ class RollingForecast(ForecastingStrategy):
         # Save visualization if enabled
         visualization_paths = []
         if save_vis:
+            channel_names = list(train_valid_data.columns)
             visualization_paths = self._save_visualization(
                 series_name=series_name,
                 actual_list=list(targets),
                 predicted_list=list(all_predicts),
                 stride=stride,
-                horizon=horizon
+                horizon=horizon,
+                model_name=self._display_model_name(model_factory),
+                eval_scaler=eval_scaler,
+                channel_names=channel_names
             )
 
         save_true_pred = self._get_scalar_config_value("save_true_pred", series_name)
@@ -419,7 +435,10 @@ class RollingForecast(ForecastingStrategy):
         actual_list: list,
         predicted_list: list,
         stride: int,
-        horizon: int
+        horizon: int,
+        model_name: str = "DUET",
+        eval_scaler=None,
+        channel_names: list = None
     ) -> dict:
         """
         Save visualization plots for the forecast results.
@@ -429,6 +448,9 @@ class RollingForecast(ForecastingStrategy):
         :param predicted_list: List of predicted values.
         :param stride: Rolling stride.
         :param horizon: Prediction horizon.
+        :param model_name: Model name for the title.
+        :param eval_scaler: Scaler for computing normalized MSE.
+        :param channel_names: List of channel names.
         :return: Dictionary of saved file paths.
         """
         # Get save path from strategy config
@@ -442,7 +464,10 @@ class RollingForecast(ForecastingStrategy):
                 predicted_data=predicted_list,
                 save_dir=vis_dir,
                 stride=stride,
-                horizon=horizon
+                horizon=horizon,
+                model_name=model_name,
+                scaler=eval_scaler,
+                channel_names=channel_names
             )
             return saved_files
         except Exception as e:

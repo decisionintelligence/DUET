@@ -12,22 +12,102 @@ from ts_benchmark.baselines.duet.utils.masked_attention import (
 )
 
 
+class GradientNormLayer(nn.Module):
+    """
+    V3 新增：梯度归一化层
+
+    防止梯度消失/爆炸，稳定训练过程
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-3):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(d_model))
+        self.shift = nn.Parameter(torch.zeros(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        x_norm = (x - mean) / (std + self.eps)
+        return self.scale * x_norm + self.shift
+
+
+class AdaptiveQuantumGate(nn.Module):
+    """
+    V3 新增：自适应量子-经典融合门控
+
+    核心思想：基于输入特征动态决定量子模块和经典模块的融合权重
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+
+        # 门控网络：根据量子输出和经典输出的差异动态调整权重
+        self.gate_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Tanh(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid(),
+        )
+
+        # 初始偏置：让量子模块在训练初期有适度的贡献
+        self.init_weight = nn.Parameter(torch.tensor([0.3]))
+
+    def forward(self, quantum_feat: torch.Tensor, classical_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            quantum_feat: 量子模块输出 [B, N, D]
+            classical_feat: 经典Transformer输出 [B, N, D]
+        Returns:
+            融合后的特征 [B, N, D]
+        """
+        # 合并两个特征
+        concat_feat = torch.cat([quantum_feat, classical_feat], dim=-1)
+
+        # 生成门控权重 [B, N, D]
+        gate = self.gate_net(concat_feat)
+
+        # 使用初始权重进行加权
+        gate = gate * (1 - self.init_weight) + self.init_weight
+
+        # 动态融合：gate 控制量子特征的贡献度
+        # 当 gate 大时，更多使用量子特征
+        # 当 gate 小时，更多使用经典特征
+        fused = gate * quantum_feat + (1 - gate) * classical_feat
+
+        return fused
+
+
 class QuantumOTOCBlock(nn.Module):
     """
-    Quantum-inspired feature mixing block - v9 纯量子版 + V2 量子损失
+    Quantum-inspired feature mixing block - V3 自适应融合版
 
-    消融实验：只使用量子模块，不经过 Highway Gate
-    测试量子模块是否在 ETTh1 上有效
+    V3 改进：
+    1. 自适应跳跃连接：移除固定 alpha，使用输入依赖的门控
+    2. 梯度归一化层：稳定训练
+    3. 动态残差缩放：根据层深度调整残差强度
 
-    V2 新增：添加量子专项损失函数来解决训练停滞问题
+    论文参考：
+    - Adaptive Skip Connections (Nick Ryan, 2024)
+    - Multi-scale Feature Fusion with Adaptive Weight
     """
 
-    def __init__(self, d_model: int, n_heads: int = 4, loss_weight: float = 1.0):
+    def __init__(self, d_model: int, n_heads: int = 4, loss_weight: float = 1.0, layer_idx: int = 0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.loss_weight = loss_weight
+        self.layer_idx = layer_idx
+
+        # V3 新增：梯度归一化层
+        self.grad_norm = GradientNormLayer(d_model)
+
+        # V3 新增：自适应残差缩放
+        # 浅层使用更强的残差（保持稳定性），深层使用更弱的残差（增加表达能力）
+        init_residual_scale = 0.8 / (1 + layer_idx * 0.2)  # 初始层 ~0.8，深层 ~0.5
+        self.residual_scale = nn.Parameter(torch.tensor(init_residual_scale))
 
         # 原始 Cayley 变换设计
         self.real_linear = nn.Linear(d_model, d_model)
@@ -51,9 +131,7 @@ class QuantumOTOCBlock(nn.Module):
 
         self.projection = nn.Linear(d_model, d_model)
 
-        # alpha=0.5 平衡设计
-        self.alpha = nn.Parameter(torch.tensor(0.5))
-
+        # V3：移除固定的 alpha，使用动态残差缩放
         self.norm = nn.LayerNorm(d_model)
 
     def _cayley_unitary(self, H: torch.Tensor) -> torch.Tensor:
@@ -167,7 +245,10 @@ class QuantumOTOCBlock(nn.Module):
         z_out = z_out * se_weight
         z_out = self.norm(z_out)
         z_out = self.projection(z_out)
-        z_out = self.alpha * z_out + (1 - self.alpha) * x_residual
+
+        # V3 新增：使用可学习的残差缩放替代固定 alpha
+        # residual_scale 控制量子特征相对于输入的贡献度
+        z_out = self.residual_scale * z_out + (1 - self.residual_scale) * x_residual
 
         # V2 新增：计算量子损失
         quantum_loss = self._compute_quantum_loss()
@@ -401,6 +482,8 @@ class DUETModel(nn.Module):
         self.use_adaptive_fusion = getattr(config, "use_adaptive_fusion", False)
         self.use_enhanced_head = getattr(config, "use_enhanced_head", False)
         self.use_quantum_parallel = getattr(config, "use_quantum_parallel", False)  # v9新增
+        # V3 新增：自适应量子-经典门控融合
+        self.use_adaptive_quantum_gate = getattr(config, "use_adaptive_quantum_gate", True)
         # V2.1 新增：量子损失权重配置，默认值从 0.01 提高到 1.0
         self.quantum_loss_weight = getattr(config, "quantum_loss_weight", 1.0)
 
@@ -408,8 +491,14 @@ class DUETModel(nn.Module):
 
         if self.use_quantum_block:
             self.quantum_block = QuantumOTOCBlock(
-                config.d_model, n_heads=n_heads, loss_weight=self.quantum_loss_weight
+                config.d_model, n_heads=n_heads, loss_weight=self.quantum_loss_weight, layer_idx=0
             )
+
+            # V3 新增：自适应门控融合模块
+            if self.use_adaptive_quantum_gate and self.use_quantum_parallel:
+                self.quantum_gate = AdaptiveQuantumGate(config.d_model)
+            else:
+                self.quantum_gate = None
 
             if self.use_quantum_parallel:
                 # v9新增：并行架构
@@ -437,6 +526,9 @@ class DUETModel(nn.Module):
             self.attn_residuals = None
             self.highway_gate = None
             self.adaptive_fusion = None
+
+        # V3.2 新增：可学习的跳跃连接权重
+        self.quantum_skip_weight = nn.Parameter(torch.tensor([0.3]))
 
         # 优化3：使用增强的预测头
         if self.use_enhanced_head:
@@ -469,14 +561,23 @@ class DUETModel(nn.Module):
                 quantum_output, quantum_loss = self.quantum_block(temporal_feature)
 
                 if self.use_quantum_parallel:
-                    # v9 新增：量子模块与Channel Transformer并行融合
+                    # V3.1 新思路：量子模块作为预处理
+                    # 先用量子模块预处理 temporal_feature
+                    quantum_preprocessed = quantum_output
+
+                    # 然后将预处理后的特征送入 Channel Transformer
                     changed_input = rearrange(input, "b l n -> b n l")
                     channel_mask = self.mask_generator(changed_input)
-                    transformer_output, _ = self.Channel_transformer(
-                        x=temporal_feature, attn_mask=channel_mask
+                    channel_group_feature, _ = self.Channel_transformer(
+                        x=quantum_preprocessed, attn_mask=channel_mask
                     )
-                    # 并行融合：各50%权重
-                    channel_group_feature = 0.5 * quantum_output + 0.5 * transformer_output
+
+                    # V3.2 新增：添加跳跃连接，让模型可以学习是否使用量子预处理
+                    # 使用可学习的融合权重
+                    channel_group_feature = (
+                        self.quantum_skip_weight * channel_group_feature +
+                        (1 - self.quantum_skip_weight) * quantum_preprocessed
+                    )
 
                 elif self.use_adaptive_fusion and self.adaptive_fusion is not None:
                     changed_input = rearrange(input, "b l n -> b n l")

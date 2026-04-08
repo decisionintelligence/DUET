@@ -17,6 +17,136 @@ from ts_benchmark.baselines.utils import (
 from ts_benchmark.baselines.duet.models.duet_model import DUETModel
 from ...models.model_base import ModelBase, BatchMaker
 
+
+class AdaptiveLossWeighting(nn.Module):
+    """
+    V4 新增：自适应损失权重调整器
+
+    实现三种策略：
+    1. GradNorm 风格梯度协调：平衡不同损失函数的梯度量级
+    2. 课程学习：训练初期主要依赖主损失，后期逐步引入辅助损失
+    3. 同方差不确定性加权：自动学习每个损失的权重
+    """
+
+    def __init__(
+        self,
+        n_losses: int = 2,
+        init_weights: list = None,
+        strategy: str = "gradnorm",
+        alpha: float = 1.5,
+        warmup_epochs: int = 5,
+    ):
+        super().__init__()
+        self.strategy = strategy
+        self.alpha = alpha
+        self.warmup_epochs = warmup_epochs
+        self.current_epoch = 0
+
+        if init_weights is None:
+            init_weights = [1.0, 0.1]  # MSE 为主，量子损失为辅
+
+        # 可学习的权重（对数形式以保证非负）
+        if strategy == "uncertainty":
+            self.log_vars = nn.Parameter(torch.tensor(init_weights))
+        else:
+            self.weights = nn.Parameter(torch.tensor(init_weights))
+
+    def forward(
+        self,
+        losses: tuple,
+        grad_norms: tuple = None,
+        epoch: int = 0,
+    ) -> tuple:
+        """
+        计算加权后的总损失和权重
+
+        Args:
+            losses: (mse_loss, quantum_loss)
+            grad_norms: (mse_grad_norm, quantum_grad_norm) 可选
+            epoch: 当前 epoch
+        Returns:
+            weighted_loss, current_weights
+        """
+        self.current_epoch = epoch
+        mse_loss, quantum_loss = losses
+
+        if self.strategy == "curriculum":
+            # 课程学习策略：逐步增加量子损失权重
+            weight = self._curriculum_weight(epoch)
+            weighted_loss = mse_loss + weight * quantum_loss
+            current_weights = (1.0, weight)
+
+        elif self.strategy == "gradnorm" and grad_norms is not None:
+            # GradNorm 策略：平衡梯度范数
+            weighted_loss, current_weights = self._gradnorm_weight(
+                losses, grad_norms
+            )
+
+        elif self.strategy == "uncertainty":
+            # 同方差不确定性加权
+            weighted_loss, current_weights = self._uncertainty_weight(losses)
+
+        else:
+            # 默认：固定权重 1:0.1
+            weighted_loss = mse_loss + 0.1 * quantum_loss
+            current_weights = (1.0, 0.1)
+
+        return weighted_loss, current_weights
+
+    def _curriculum_weight(self, epoch: int) -> float:
+        """课程学习：逐步增加量子损失权重"""
+        if epoch < self.warmup_epochs:
+            # 预热期：量子损失权重为 0
+            return 0.0
+        else:
+            # 之后线性增加，最大到 0.5
+            progress = min(1.0, (epoch - self.warmup_epochs) / 20.0)
+            return 0.5 * progress
+
+    def _gradnorm_weight(self, losses: tuple, grad_norms: tuple) -> tuple:
+        """GradNorm 风格梯度协调"""
+        mse_loss, quantum_loss = losses
+        mse_grad, quantum_grad = grad_norms
+
+        # 计算目标梯度范数（取平均）
+        target_norm = (mse_grad + quantum_grad) / 2
+
+        # 计算权重比
+        if quantum_grad > 1e-6:
+            ratio = mse_grad / quantum_grad
+            # 调整量子损失权重以平衡梯度
+            quantum_weight = self.weights[1] * (target_norm / quantum_grad) ** self.alpha
+        else:
+            quantum_weight = 0.0
+
+        # 保证权重为正
+        quantum_weight = max(0.01, quantum_weight)
+
+        weighted_loss = mse_loss + quantum_weight * quantum_loss
+        current_weights = (1.0, quantum_weight)
+
+        return weighted_loss, current_weights
+
+    def _uncertainty_weight(self, losses: tuple) -> tuple:
+        """同方差不确定性加权（Kendall 风格）"""
+        mse_loss, quantum_loss = losses
+
+        # 转换对数为权重（方差越大，权重越小）
+        var_MSE = torch.exp(-self.log_vars[0])
+        var_Quantum = torch.exp(-self.log_vars[1])
+
+        # 加权损失
+        weighted_loss = var_MSE * mse_loss + var_Quantum * quantum_loss
+        weighted_loss += self.log_vars[0] + self.log_vars[1]
+
+        # 转换为概率权重
+        total_var = torch.exp(-self.log_vars[0]) + torch.exp(-self.log_vars[1])
+        weight_MSE = torch.exp(-self.log_vars[0]) / total_var
+        weight_Quantum = torch.exp(-self.log_vars[1]) / total_var
+
+        return weighted_loss, (weight_MSE.item(), weight_Quantum.item())
+
+
 DEFAULT_TRANSFORMER_BASED_HYPER_PARAMS = {
     "enc_in": 1,
     "dec_in": 1,
@@ -310,8 +440,20 @@ class DUET(ModelBase):
 
         print(f"Total trainable parameters: {total_params}")
 
+        # V4 新增：初始化自适应损失权重调整器
+        adaptive_weighting = None
+        if config.use_quantum_block and getattr(config, 'adaptive_loss_weight', False):
+            strategy = getattr(config, 'adaptive_weight_strategy', 'curriculum')
+            adaptive_weighting = AdaptiveLossWeighting(
+                strategy=strategy,
+                warmup_epochs=getattr(config, 'adaptive_warmup_epochs', 5),
+            ).to(device)
+            print(f"Adaptive Loss Weighting: {strategy} 策略")
+
         for epoch in range(config.num_epochs):
             self.model.train()
+            epoch_quantum_weight = 0.0  # 记录本 epoch 的量子损失权重
+
             # for input, target, input_mark, target_mark in train_data_loader:
             for i, (input, target, input_mark, target_mark) in enumerate(
                 train_data_loader
@@ -331,10 +473,24 @@ class DUET(ModelBase):
                 output = output[:, -config.horizon :, :]
                 loss = criterion(output, target)
 
-                total_loss = loss + loss_importance
+                # V4 新增：使用自适应权重
+                if adaptive_weighting is not None:
+                    total_loss, weights = adaptive_weighting(
+                        (loss, loss_importance), epoch=epoch
+                    )
+                    epoch_quantum_weight = weights[1]
+                else:
+                    quantum_weight = getattr(config, 'quantum_loss_weight', 0.0)
+                    total_loss = loss + quantum_weight * loss_importance
+                    epoch_quantum_weight = quantum_weight
+
                 total_loss.backward()
 
                 optimizer.step()
+
+            # 每10个epoch打印一次权重
+            if epoch % 10 == 0 and adaptive_weighting is not None:
+                print(f"  [Epoch {epoch}] Quantum weight: {epoch_quantum_weight:.4f}")
 
             if train_ratio_in_tv != 1:
                 valid_loss = self.validate(valid_data_loader, criterion)

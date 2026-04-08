@@ -14,17 +14,20 @@ from ts_benchmark.baselines.duet.utils.masked_attention import (
 
 class QuantumOTOCBlock(nn.Module):
     """
-    Quantum-inspired feature mixing block - v9 纯量子版
+    Quantum-inspired feature mixing block - v9 纯量子版 + V2 量子损失
 
     消融实验：只使用量子模块，不经过 Highway Gate
     测试量子模块是否在 ETTh1 上有效
+
+    V2 新增：添加量子专项损失函数来解决训练停滞问题
     """
 
-    def __init__(self, d_model: int, n_heads: int = 4):
+    def __init__(self, d_model: int, n_heads: int = 4, loss_weight: float = 1.0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        self.loss_weight = loss_weight
 
         # 原始 Cayley 变换设计
         self.real_linear = nn.Linear(d_model, d_model)
@@ -66,6 +69,62 @@ class QuantumOTOCBlock(nn.Module):
         s = F.relu(self.se_fc1(s))
         s = torch.sigmoid(self.se_fc2(s))
         return s.unsqueeze(1)
+
+    def _compute_quantum_loss(self) -> torch.Tensor:
+        """
+        V2.2 新增：增强的量子专项损失函数
+
+        包含三个组件：
+        1. 厄米特性损失：确保 H 和 M 是厄米矩阵
+        2. 范数正则化：防止参数梯度消失或爆炸
+        3. 正交性损失：鼓励参数矩阵具有多样性
+
+        设计原理：量子模块参数需要更强的梯度信号才能持续优化
+        """
+        device = self.H_real.device
+        loss = torch.tensor(0.0, device=device)
+
+        # ===== 1. 厄米特性损失 =====
+        # H 和 M 应该是厄米矩阵（自共轭）
+        H_real_sym = (self.H_real + self.H_real.transpose(-2, -1)) / 2
+        H_imag_skew = (self.H_imag - self.H_imag.transpose(-2, -1)) / 2
+        loss_H = (H_real_sym - self.H_real).pow(2).mean() + \
+                 (H_imag_skew - self.H_imag).pow(2).mean()
+
+        M_real_sym = (self.M_real + self.M_real.transpose(-2, -1)) / 2
+        M_imag_skew = (self.M_imag - self.M_imag.transpose(-2, -1)) / 2
+        loss_M = (M_real_sym - self.M_real).pow(2).mean() + \
+                 (M_imag_skew - self.M_imag).pow(2).mean()
+
+        loss = loss + loss_H + loss_M
+
+        # ===== 2. 范数正则化（V2.2 新增）=====
+        # 鼓励参数有足够的激活，防止死亡梯度
+        # 通过惩罚参数的 L2 范数过小或过大
+        H_norm = self.H_real.pow(2).mean()
+        M_norm = self.M_real.pow(2).mean()
+
+        # 目标：H_norm 和 M_norm 应该在 [0.01, 1.0] 范围内
+        target_norm = 0.1
+        loss = loss + (H_norm - target_norm).pow(2) * 2.0
+        loss = loss + (M_norm - target_norm).pow(2) * 2.0
+
+        # ===== 3. 奇异值多样性损失（V2.2 新增）=====
+        # 鼓励 H 矩阵具有非零奇异值，增加量子多样性
+        for H in [self.H_real, self.M_real]:
+            # 计算奇异值
+            s = torch.linalg.svdvals(H.reshape(self.n_heads, -1))
+            if s.sum() > 1e-6:
+                # 计算奇异值的变异系数（标准差/均值）
+                # 高变异系数意味着奇异值分布不均匀（多样性好）
+                cv = s.std() / (s.mean() + 1e-6)
+                # 添加一个小损失来鼓励适度的变异
+                # 目标：cv 应该在 [0.5, 2.0] 范围内
+                target_cv = 1.0
+                loss = loss + (cv - target_cv).pow(2) * 0.5
+
+        # 动态权重：默认值为 1.0
+        return self.loss_weight * loss
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, D = x.shape
@@ -110,7 +169,10 @@ class QuantumOTOCBlock(nn.Module):
         z_out = self.projection(z_out)
         z_out = self.alpha * z_out + (1 - self.alpha) * x_residual
 
-        return z_out
+        # V2 新增：计算量子损失
+        quantum_loss = self._compute_quantum_loss()
+
+        return z_out, quantum_loss
 
 
 class AdaptiveFusion(nn.Module):
@@ -339,11 +401,15 @@ class DUETModel(nn.Module):
         self.use_adaptive_fusion = getattr(config, "use_adaptive_fusion", False)
         self.use_enhanced_head = getattr(config, "use_enhanced_head", False)
         self.use_quantum_parallel = getattr(config, "use_quantum_parallel", False)  # v9新增
+        # V2.1 新增：量子损失权重配置，默认值从 0.01 提高到 1.0
+        self.quantum_loss_weight = getattr(config, "quantum_loss_weight", 1.0)
 
         n_heads = getattr(config, "n_heads", 4)
 
         if self.use_quantum_block:
-            self.quantum_block = QuantumOTOCBlock(config.d_model, n_heads=n_heads)
+            self.quantum_block = QuantumOTOCBlock(
+                config.d_model, n_heads=n_heads, loss_weight=self.quantum_loss_weight
+            )
 
             if self.use_quantum_parallel:
                 # v9新增：并行架构
@@ -395,9 +461,12 @@ class DUETModel(nn.Module):
 
         temporal_feature = rearrange(temporal_feature, "b d n -> b n d")
 
+        # V2 新增：初始化量子损失
+        quantum_loss = None
+
         if self.n_vars > 1:
             if self.quantum_block is not None:
-                quantum_output = self.quantum_block(temporal_feature)
+                quantum_output, quantum_loss = self.quantum_block(temporal_feature)
 
                 if self.use_quantum_parallel:
                     # v9 新增：量子模块与Channel Transformer并行融合
@@ -441,12 +510,16 @@ class DUETModel(nn.Module):
                 channel_group_feature, attention = self.Channel_transformer(
                     x=temporal_feature, attn_mask=channel_mask
                 )
+                quantum_loss = L_importance  # 非量子模式下用 L_importance
 
             output = self.linear_head(channel_group_feature)
         else:
             output = temporal_feature
             output = self.linear_head(output)
+            quantum_loss = L_importance  # n_vars=1 时也用 L_importance
 
         output = rearrange(output, "b n d -> b d n")
         output = self.cluster.revin(output, "denorm")
-        return output, L_importance
+        # V2 新增：返回量子损失以便在训练时整合
+        total_quantum_loss = quantum_loss
+        return output, total_quantum_loss
